@@ -44,6 +44,27 @@ cp .env.example .env
 `ARTIST_USERNAME` оставлен пустым: впишите свой username без `@` в `.env` или отправьте `/set artist_username ваш_username`.
 После заполнения в профиле появится кнопка прямого перехода в ваш чат. Пока username не задан, работает передача сообщений через `/contact` и ответ через `/reply`/`/send`.
 
+## Размещение на BotHost
+
+На [странице создания бота](https://bothost.ru/create-bot.php) выберите Telegram и Python. Репозиторий: `https://github.com/tibrisvolk-cloud/tibris-cube-studio.git`, ветка `main`.
+В дополнительных настройках укажите главный файл `main.py` и стандартную автоматически генерируемую сборку Python. Для этого варианта опция собственного Dockerfile должна быть выключена.
+Токен указывается в поле Bot Token или переменной `BOT_TOKEN` в панели; файл `.env` на хостинг загружать не требуется.
+
+Перед запуском добавьте переменные:
+
+| Ключ | Значение |
+|---|---|
+| ADMIN_ID | Ваш числовой Telegram user ID, без @ |
+| DB_PATH | /app/data/bot_data.db |
+| ARTIST_NAME | Tibris |
+| ARTIST_USERNAME | Ваш username без @; можно пока не добавлять |
+
+BotHost автоматически устанавливает зависимости из `requirements.txt`. Путь `/app/data` выбран для сохранения базы при обновлениях из Git. При первом запуске бот создаст её сам. API-ключи оплат подключайте отдельно после запуска основного бота.
+Сохраните настройки, выполните деплой и смотрите runtime-логи. Затем отправьте `/start` боту из своего администраторского аккаунта.
+Если появляется Conflict от getUpdates, остановите второй процесс с тем же токеном. При ошибке записи базы проверьте доступность папки `/app/data` на хостинге.
+
+Источники: [быстрый старт BotHost](https://bothost.ru/docs/getting-started), [главный файл](https://bothost.ru/docs/main-file-entrypoint), [переменные окружения](https://bothost.ru/docs/environment-variables), [постоянное хранение базы](https://bothost.ru/docs/database-storage).
+
 ### Docker
 
 ```sh
