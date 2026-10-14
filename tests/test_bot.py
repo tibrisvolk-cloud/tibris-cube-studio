@@ -80,15 +80,16 @@ def test_navigation_clears_stale_answer(bot):
 def test_order_refs_submission_and_no_duplicate(bot):
     context = ctx()
     asyncio.run(bot.callback(callback(1, "neworder:classic_head"), context))
-    sid = bot.s.free_slots("classic_head")[0]["id"]
-    asyncio.run(bot.callback(callback(1, f"chooseslot:{sid}:classic_head"), context))
+    asyncio.run(bot.callback(callback(1, "build_bg:0"), context))
+    asyncio.run(bot.callback(callback(1, "build_second:0"), context))
     asyncio.run(bot.on_message(message(1, "My OC head"), context))
     asyncio.run(bot.on_message(message(1, photo=[NS(file_id="ref")]), context))
     asyncio.run(bot.callback(callback(1, "refs_done"), context))
-    asyncio.run(bot.callback(callback(1, "coupon:0"), context))
+    asyncio.run(bot.callback(callback(1, "build_pay:rub"), context))
+    asyncio.run(bot.callback(callback(1, "build_submit"), context))
     assert len(bot.s.rows("SELECT * FROM orders")) == 1
     with pytest.raises(RuleError):
-        asyncio.run(bot.callback(callback(1, "coupon:0"), context))
+        asyncio.run(bot.callback(callback(1, "build_submit"), context))
 
 
 def test_invoice_ownership_and_xtr(bot):
@@ -145,15 +146,13 @@ def test_profile_has_balance_orders_and_direct_artist_chat(bot):
     assert any(b.callback_data == "orders:0" for row in markup.inline_keyboard for b in row)
 
 
-def test_admin_ych_creation_requires_uploaded_picture(bot):
+def test_ych_menu_and_legacy_button_are_removed(bot):
     context = ctx()
-    asyncio.run(bot.callback(callback(99, "addych"), context))
-    asyncio.run(bot.on_message(message(99, "Pose | 150 | 1 | Your OC in this pose"), context))
+    asyncio.run(bot.callback(callback(1, "studio"), context))
+    markup = context.bot.send_photo.call_args.kwargs["reply_markup"]
+    assert not any(b.callback_data == "cat:ych" for row in markup.inline_keyboard for b in row)
     with pytest.raises(RuleError):
-        asyncio.run(bot.on_message(message(99, "нет"), context))
-    asyncio.run(bot.on_message(message(99, photo=[NS(file_id="own_sketch")]), context))
-    assert bot.s.one("SELECT * FROM art_products WHERE slug='ych_1'")["rub"] == 150
-    assert len(bot.s.free_slots("ych_1")) == 1
+        asyncio.run(bot.callback(callback(99, "addych"), context))
 
 
 def test_user_promo_router_creates_discount_coupon(bot):

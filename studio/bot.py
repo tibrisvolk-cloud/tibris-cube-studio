@@ -23,6 +23,9 @@ from .catalog import CATEGORIES, STATUS
 from .autopay import AutoPay
 from .config import Config
 from .store import RuleError, Store, positive
+from .admin_ui import AdminUI
+from .order_ui import OrderUI
+from .ordering import discounted
 
 log = logging.getLogger(__name__)
 ASSETS = Path(__file__).resolve().parents[1] / "assets"
@@ -37,10 +40,22 @@ def kb(rows):
     return Markup([[Button(label, callback_data=data) for label, data in row] for row in rows])
 
 
+def text_chunks(text, limit):
+    start = units = 0
+    for index, char in enumerate(text):
+        size = len(char.encode("utf-16-le")) // 2
+        if units + size > limit:
+            yield text[start:index]
+            start, units = index, 0
+        units += size
+    if start < len(text):
+        yield text[start:]
+
+
 HOME = [("🏠 Главная", "home")]
 
 
-class Bot:
+class Bot(AdminUI, OrderUI):
     def __init__(self, config, store=None):
         self.cfg = config
         self.s = store or Store(config.db_path)
@@ -65,18 +80,33 @@ class Bot:
             }
         return None
 
-    async def send_file(self, context, uid, media, caption=None):
+    async def send_file(self, context, uid, media, caption=None, reply_markup=None):
         if media["kind"] == "photo":
-            return await context.bot.send_photo(uid, media["file_id"], caption=caption)
-        return await context.bot.send_document(uid, media["file_id"], caption=caption)
+            return await context.bot.send_photo(
+                uid, media["file_id"], caption=caption, reply_markup=reply_markup
+            )
+        return await context.bot.send_document(
+            uid, media["file_id"], caption=caption, reply_markup=reply_markup
+        )
 
     async def tell(self, context, uid, text, rows=None, image=None, media=None):
         markup = kb(rows) if rows else None
         selected = media or (self.s.one("SELECT * FROM media WHERE key=?", (image,)) if image else None)
-        # Keep long descriptions out of Telegram's 1024-character photo caption limit.
+        # Attach the text and buttons to the image. Long pages continue after a caption.
+        caption = ""
+        units = 0
+        for char in text:
+            size = len(char.encode("utf-16-le")) // 2
+            if units + size > 1024:
+                break
+            caption += char
+            units += size
+        remainder = text[len(caption) :]
+        attached = False
         if selected:
             try:
-                await self.send_file(context, uid, selected)
+                await self.send_file(context, uid, selected, caption, markup if not remainder else None)
+                attached = True
             except TelegramError:
                 log.warning("Could not display configured media for %s", image)
         elif image:
@@ -85,16 +115,23 @@ class Bot:
                 path = ASSETS / "main.png"
             if path.exists():
                 with path.open("rb") as photo:
-                    await context.bot.send_photo(uid, photo)
-        for i in range(0, len(text), 3900):
+                    try:
+                        await context.bot.send_photo(
+                            uid, photo, caption=caption, reply_markup=markup if not remainder else None
+                        )
+                        attached = True
+                    except TelegramError:
+                        log.warning("Could not display bundled media for %s", image)
+        if attached:
+            text = remainder
+        chunks = list(text_chunks(text, 3900))
+        for i, chunk in enumerate(chunks):
             # Text pages use plain text for safe splitting and literal user/admin content.
-            await context.bot.send_message(
-                uid, text[i : i + 3900], reply_markup=markup if i + 3900 >= len(text) else None
-            )
+            await context.bot.send_message(uid, chunk, reply_markup=markup if i == len(chunks) - 1 else None)
 
-    async def notify(self, context, uid, text):
+    async def notify(self, context, uid, text, rows=None):
         try:
-            await self.tell(context, uid, text)
+            await self.tell(context, uid, text, rows)
             return True
         except TelegramError:
             log.warning("Notification failed for user %s", uid)
@@ -126,7 +163,7 @@ class Bot:
 
     async def cancel(self, update, context):
         self.s.clear_dialog(update.effective_user.id)
-        await update.effective_message.reply_text("Диалог отменён. /start — в главное меню.")
+        await self.home(context, update.effective_user.id)
 
     async def contact(self, context, uid):
         self.s.save_dialog(uid, "contact", {})
@@ -136,7 +173,7 @@ class Bot:
             context,
             uid,
             "💬 Напишите сообщение или приложите файл — я передам его Tibris.\n"
-            "Для ответа по заказу укажите его номер. /cancel — отмена." + suffix,
+            "Для ответа по заказу укажите его номер." + suffix,
             [[("🏠 Главная", "home")]],
         )
 
@@ -157,73 +194,84 @@ class Bot:
 
     async def order_card(self, context, uid, oid):
         o = self.s.order(oid, None if uid == self.cfg.admin_id else uid)
-        text = f"Заказ #{oid} · {o['title']}\n{STATUS[o['status']]}\nСлот: {o['slot_label'] or 'назначается'}\n\n{o['brief']}"
-        rows = []
-        if o["status"] == "quoted":
-            text += f"\n\nСогласованная цена: {o['rub']} ₽"
+        text = f"🐾 Заказ #{oid} · {o['title']}\n{STATUS[o['status']]}"
+        options = json.loads(o["options"])
+        if options:
+            text += f"\nПерсонажей: {options.get('characters', 1)}"
+            if o["category"] != "minecraft":
+                text += "\nФон: " + ("подробный" if options.get("background") else "без подробного фона")
+        if o["status"] == "requested" and o["base_rub"]:
+            text += f"\nРасчёт: {discounted(o['base_rub'], o['discount'])} ₽"
+            text += "\nОжидаем согласования Tibris 🐾"
+        elif o["rub"] is not None:
+            text += f"\nСтоимость: {o['rub']} ₽"
             if o["stars"]:
                 text += f" / {o['stars']} ⭐"
             if o["points"]:
-                text += f"\nАрт за баллы: {o['points']} pts"
-            if o["discount"]:
-                text += f"\nСкидка {o['discount']}% уже учтена."
-            text += f"\nУсловия Tibris: {o['note']}"
-            if o["payment_method"]:
-                text += f"\nВнешний расчёт: {o['external_amount']} {o['external_currency']} · {o['payment_method']}"
+                text += f"\nЗа баллы Cube: {o['points']}"
+        if o["discount"]:
+            text += f"\nСкидка −{o['discount']}% учтена."
+        text += f"\n\n📝 Ваша идея\n{o['brief']}"
+        if o["note"]:
+            text += f"\n\nСрок и условия: {o['note']}"
+        if o["payment_method"]:
+            text += f"\nОплата: {o['payment_method']} · {o['external_amount']} {o['external_currency']}"
+            if o["proof"] and o["status"] == "quoted":
+                text += "\n🕒 Проверяем поступление оплаты."
+        rows = []
+        auto_invoice = self.s.auto_invoice(oid)
+        payment_locked = bool(
+            o["proof"]
+            or o["checkout_until"] > time.time()
+            or (auto_invoice and auto_invoice["state"] in {"creating", "uncertain", "pending"})
+        )
+        if uid == o["user_id"] and o["status"] == "quoted":
+            if o["points"] or o["discount"] == 100:
+                rows.append([("🎁 Подтвердить заказ за бонус", f"redeem:{oid}")])
+            elif o["payment_method"]:
+                rows.append([("💳 Продолжить оплату", f"external:{oid}")])
+                if not payment_locked:
+                    rows.append([("Другой способ оплаты", f"paymenu:{oid}")])
+            else:
+                rows.append([("💳 Выбрать способ оплаты", f"paymenu:{oid}")])
+        if uid == self.cfg.admin_id:
+            text += f"\n\nКлиент: {o['user_id']} · Место: {o['slot_label'] or '—'}"
+            if o["preferred_method"]:
+                text += f"\nПредпочтение оплаты: {o['preferred_method']}"
+            rows.append(
+                [("📎 Референсы", f"refs:{oid}"), ("💬 Ответить клиенту", f"aui:reply:{o['user_id']}")]
+            )
+            if o["status"] in {"requested", "quoted"}:
+                if o["status"] == "requested" and not payment_locked:
+                    rows.append([("✅ Принять и указать срок", f"aui:accept:{oid}")])
+                if not payment_locked:
+                    rows.append([("💰 Изменить цену и условия", f"aui:quote:{oid}")])
+                if o["payment_method"] and o["gateway"] == "manual":
+                    rows.append([("✅ Подтвердить поступление", f"aui:markpaid:{oid}")])
                 if o["proof"]:
-                    text += "\n🕒 Подтверждение отправлено. Tibris проверяет поступление."
-            if uid == o["user_id"]:
-                if o["payment_method"]:
-                    rows.append([("💳 Реквизиты и подтверждение", f"external:{oid}")])
-                elif o["points"] or o["discount"] == 100:
-                    rows.append([("✅ Подтвердить заказ за баллы / бонус", f"redeem:{oid}")])
-                elif o["stars"]:
-                    rows.append([("⭐ Оплатить Stars", f"invoice:{oid}")])
+                    rows.append([("🧾 Чек клиента", f"proof:{oid}")])
+                if auto_invoice:
+                    rows += [
+                        [("🔎 Проверить оплату", f"autocheck:{oid}")],
+                        [("Отменить внешний счёт и заказ", f"aui:void:{oid}")],
+                    ]
+            if o["status"] == "paid":
+                rows.append([("🎨 Начать работу", f"working:{oid}")])
+            if o["status"] in {"paid", "working"}:
+                rows.append([("📦 Выдать готовую работу", f"deliverui:{oid}")])
+            if o["status"] in {"paid", "working", "delivered"}:
+                rows.append([("↩️ Возврат оплаты", f"aui:refund:{oid}")])
+        else:
+            rows.append([("💬 Написать Tibris", "contact")])
         if o["status"] in {"requested", "quoted"}:
             rows.append([("Отменить заявку", f"cancelorder:{oid}")])
         if o["status"] == "delivered" and o["result"]:
-            rows.append([("📥 Получить файл ещё раз", f"result:{oid}")])
-        if uid == self.cfg.admin_id:
-            rows.extend(
-                [
-                    [("📎 Референсы", f"refs:{oid}")],
-                    [("📝 Предложить цену", f"quoteui:{oid}")],
-                    [("🎨 В работу", f"working:{oid}"), ("📦 Выдать", f"deliverui:{oid}")],
-                ]
-            )
-            text += f"\n\nКлиент: {o['user_id']}\nSKU: {o['slug']}"
-            if o["payment_method"] and o["status"] == "quoted":
-                text += f"\nДля подтверждения: /markpaid {oid} номер_операции"
-                if o["proof"]:
-                    rows.append([("🧾 Подтверждение клиента", f"proof:{oid}")])
-        rows.extend(
-            [
-                [("💬 Обсудить", "contact")],
-                [("🔙 Заказы", "adminorders:0" if uid == self.cfg.admin_id else "orders:0")],
-                HOME,
-            ]
-        )
+            rows.append([("📥 Скачать работу", f"result:{oid}")])
+        rows += [
+            [("← Заказы", "adminorders:0" if uid == self.cfg.admin_id else "orders:0")],
+            [("🏠 Главная", "home")],
+        ]
         await self.tell(context, uid, text, rows)
-
-    async def coupon_choice(self, context, uid):
-        d = self.s.dialog(uid)
-        if not d or d[0] != "order":
-            raise RuleError("Заявка истекла. Начните заново.")
-        data = d[1]
-        data["step"] = "coupon"
-        self.s.save_dialog(uid, "order", data)
-        coupons = self.s.rows(
-            "SELECT * FROM coupons WHERE user_id=? AND state='available' ORDER BY id", (uid,)
-        )
-        rows = [[(f"Купон #{c['id']} · −{c['percent']}%", f"coupon:{c['id']}")] for c in coupons[:20]]
-        rows.extend([[("Без купона", "coupon:0")], [("Отменить", "home")]])
-        await self.tell(
-            context,
-            uid,
-            "Применим бонус Digital Cube? Купон закрепится за этой заявкой; "
-            "при отмене до оплаты он вернётся. Арт целиком за pts оформляется без купона.",
-            rows,
-        )
 
     async def callback(self, update, context):
         q = update.callback_query
@@ -249,6 +297,15 @@ class Bot:
             "adminorders",
         }:
             self.s.clear_dialog(uid)
+        if action in {"aui", "av"}:
+            await self.admin_callback(context, uid, parts)
+            return
+        if action.startswith("build_") or action in {"paymenu", "paypick"}:
+            result = await self.order_callback(context, uid, action, parts)
+            if isinstance(result, tuple):
+                action, arg = result
+            else:
+                return
         if action == "home":
             await self.home(context, uid)
         elif action == "studio":
@@ -271,7 +328,10 @@ class Bot:
                 raise RuleError("Раздел не найден.")
             name, description = CATEGORIES[arg]
             products = self.s.rows("SELECT * FROM art_products WHERE category=? AND active=1", (arg,))
-            text = self.s.setting("text:" + arg, name + "\n\n" + description) + "\n\n"
+            text = (
+                self.s.setting("text:" + arg, name + "\n\n" + description)
+                + "\n\nВыберите формат — настроим заказ в несколько шагов 🐾"
+            )
             rows = []
             for p in products:
                 price = ("от " if p["price_from"] else "") + f"{p['rub']} ₽"
@@ -279,107 +339,36 @@ class Bot:
                     price += f" / {p['stars']} ⭐"
                 if p["points"]:
                     price += f" / {p['points']} pts"
-                text += f"• {p['title']} — {price}\n"
-                text += f"  Свободных мест: {len(self.s.free_slots(p['slug'], uid))}\n"
-                rows.append([(p["title"], f"product:{p['slug']}")])
-            text += "\nИтоговую стоимость и условия я подтвержу после просмотра вашей идеи."
+                rows.append([(f"{p['title']} · {price}", f"product:{p['slug']}")])
+
             rows += [[("🖼 Примеры работ", f"portfolio:{arg}")], [("🔙 Студия", "studio")]]
             await self.tell(context, uid, text, rows, arg)
-        elif action == "product":
-            p = self.s.one("SELECT * FROM art_products WHERE slug=? AND active=1", (arg,))
-            if not p:
-                raise RuleError("Формат не найден.")
-            text = f"{p['title']}\n\n{p['description']}\n\nБазовая цена: {'от ' if p['price_from'] else ''}{p['rub']} ₽"
-            if p["stars"]:
-                text += f" / {p['stars']} ⭐"
-            if p["points"]:
-                text += f"\nМожно заказать за {p['points']} pts после согласования."
-            text += (
-                "\n\nПодготовьте описание и референсы. Стоимость сложного фона, дополнительных персонажей "
-            )
-            text += "и срок согласуем до оплаты. Способ оплаты и реквизиты обсудим после заявки."
-            text += f"\nСвободных слотов: {len(self.s.free_slots(arg, uid))}."
-            await self.tell(
-                context,
-                uid,
-                text,
-                [[("🐾 Выбрать слот", f"neworder:{arg}")], [("🔙 К форматам", f"cat:{p['category']}")]],
-                "product:" + arg,
-            )
-        elif action == "neworder":
-            if self.s.setting("commissions_open", "1") != "1":
-                raise RuleError("Приём новых заявок временно закрыт. Можно написать Tibris.")
-            p = self.s.one("SELECT * FROM art_products WHERE slug=? AND active=1", (arg,))
-            if not p:
-                raise RuleError("Формат недоступен.")
-            await self.slot_choice(context, uid, arg)
+        elif action in {"product", "neworder"}:
+            await self.begin_order(context, uid, arg)
         elif action == "chooseslot":
-            slug = parts[2]
-            if self.s.setting("commissions_open", "1") != "1":
-                raise RuleError("Приём новых заявок закрыт.")
-            selected = self.s.hold_slot(uid, int(arg), slug)
-            previous = self.s.dialog(uid)
-            if (
-                previous
-                and previous[0] == "order"
-                and previous[1].get("slug") == slug
-                and previous[1].get("brief")
-            ):
-                data = previous[1]
-                data["slot_id"] = int(arg)
-                self.s.save_dialog(uid, "order", data)
-                await self.coupon_choice(context, uid)
-                return
-            self.s.save_dialog(uid, "order", {"slug": slug, "slot_id": int(arg), "step": "brief", "refs": []})
-            await self.tell(
-                context,
-                uid,
-                f"Место «{selected['title']}» зарезервировано на 30 минут; "
-                "каждый шаг заявки продлевает резерв.",
-            )
-            await self.tell(
-                context,
-                uid,
-                "📝 Расскажите об идее: персонаж, поза или эмоция, фон, формат, "
-                "срок и пожелания. До 3500 символов. Затем прикрепим референсы. /cancel — отмена.",
-            )
+            raise RuleError("Теперь бот выбирает свободное место сам. Откройте формат в каталоге 🐾")
         elif action == "refs_done":
             d = self.s.dialog(uid)
             if not d or d[0] != "order" or d[1].get("step") != "refs":
                 raise RuleError("Заявка истекла. Начните заново.")
             await self.coupon_choice(context, uid)
         elif action == "coupon":
-            d = self.s.dialog(uid)
-            if not d or d[0] != "order" or d[1].get("step") != "coupon":
-                raise RuleError("Заявка уже отправлена или истекла.")
-            data = d[1]
-            try:
-                oid = self.s.create_order(
-                    uid, data["slug"], data["brief"], data["refs"], int(arg) or None, data["slot_id"]
-                )
-            except RuleError as e:
-                if "слот" in str(e).lower() or "мест" in str(e).lower():
-                    await self.slot_choice(context, uid, data["slug"])
-                raise
-            self.s.clear_dialog(uid)
-            await self.notify(
-                context,
-                self.cfg.admin_id,
-                f"🐾 Новая заявка #{oid} от @{q.from_user.username or uid}.\n"
-                f"{data['brief']}\n/admin — открыть очередь и референсы.",
+            data = self.draft(uid, "coupon")
+            cid = int(arg) or None
+            coupon = (
+                self.s.one("SELECT * FROM coupons WHERE id=? AND user_id=? AND state='available'", (cid, uid))
+                if cid
+                else None
             )
-            await self.tell(
-                context,
-                uid,
-                f"Заявка #{oid} у Tibris 🐾\nЯ посмотрю референсы и пришлю цену и условия.",
-                [[("📦 Открыть заявку", f"order:{oid}")], HOME],
-            )
+            if cid and not coupon:
+                raise RuleError("Этот купон уже недоступен.")
+            data.update(coupon_id=cid, discount=coupon["percent"] if coupon else 0, step="payment")
+            self.s.save_dialog(uid, "order", data)
+            await self.draft_payment(context, uid)
         elif action in {"orders", "adminorders"}:
             if action == "adminorders":
-                self.admin(uid)
-                orders = self.s.rows(
-                    "SELECT o.*,p.title FROM orders o JOIN art_products p ON o.slug=p.slug ORDER BY o.id DESC"
-                )
+                await self.admin_queue(context, uid, arg, parts[2] if len(parts) > 2 else "active")
+                return
             else:
                 orders = self.s.rows(
                     "SELECT o.*,p.title FROM orders o JOIN art_products p ON o.slug=p.slug WHERE user_id=? ORDER BY o.id DESC",
@@ -415,7 +404,7 @@ class Bot:
             await self.order_card(context, uid, int(arg))
         elif action == "invoice":
             o = self.s.order(int(arg), uid)
-            if o["status"] != "quoted" or not o["stars"] or o["points"]:
+            if o["status"] != "quoted" or not o["stars"] or o["points"] or o["payment_method"]:
                 raise RuleError("Счёт недоступен.")
             await context.bot.send_invoice(
                 uid,
@@ -492,7 +481,8 @@ class Bot:
                 uid,
                 proof.get("text")
                 or "Проверьте поступление в банке / кабинете сервиса / кошельке. "
-                f"После проверки: /markpaid {arg} номер_операции",
+                "Нажмите «Подтвердить поступление» только после проверки.",
+                [[("✅ Подтвердить поступление", f"aui:markpaid:{arg}")], [("← Заказ", f"order:{arg}")]],
             )
         elif action == "redeem":
             self.s.redeem_art(uid, int(arg))
@@ -518,13 +508,7 @@ class Bot:
                 await self.notify(context, o["user_id"], f"🎨 Tibris начал работу над заказом #{arg}.")
                 await self.order_card(context, uid, int(arg))
             elif action == "quoteui":
-                self.s.save_dialog(uid, "quote", {"oid": int(arg)})
-                await self.tell(
-                    context,
-                    uid,
-                    "Введите: рубли | Stars | условия и срок\n"
-                    "Скидка купона применится автоматически. Для заказа за pts: /quotepts ID условия.",
-                )
+                await self.admin_callback(context, uid, ["aui", "quote", arg])
             else:
                 if o["status"] not in {"paid", "working"}:
                     raise RuleError("Сначала дождитесь оплаты.")
@@ -532,8 +516,8 @@ class Bot:
                 await self.tell(
                     context,
                     uid,
-                    "Отправьте готовый арт файлом или изображением. "
-                    "Файл сохранит исходное качество. /cancel — отмена.",
+                    "Отправьте готовый арт файлом или изображением. Файл сохранит исходное качество.",
+                    [[("Отменить", "admin")]],
                 )
         elif action == "cube":
             await self.tell(
@@ -589,7 +573,10 @@ class Bot:
         elif action == "promo":
             self.s.save_dialog(uid, "promo", {})
             await self.tell(
-                context, uid, "Введите текстовый промокод. Регистр букв не важен. /cancel — отмена."
+                context,
+                uid,
+                "🎟 Пришлите ваш промокод. Большие и маленькие буквы не имеют значения.",
+                [[("Отменить", "profile")]],
             )
         elif action == "riddles":
             await self.list_page(
@@ -823,8 +810,8 @@ class Bot:
                     "📜 Как заказать\n\n1. Выберите формат и отправьте "
                     "идею с референсами.\n2. Tibris согласует цену, срок, этапы и правки.\n3. После согласования "
                     "оплатите согласованным способом или подтвердите разрешённый арт за pts.\n4. Готовый файл придёт в этот бот.\n\n"
-                    "Не оплачивайте заказ до согласования. Дополнительный персонаж Classic: +100% базовой цены. "
-                    "Сложный фон — по договорённости. Вопросы и возвраты: /paysupport. "
+                    f"Дополнительный персонаж: +{self.s.setting('extra_character_percent', '100')}% базовой цены, подробный фон — по цене в конструкторе. "
+                    "Вопросы и возвраты — через кнопку связи с Tibris. "
                     "До оплаты уточните права использования и число правок.",
                 ),
                 [[("🎨 Каталог", "studio")], HOME],
@@ -846,24 +833,12 @@ class Bot:
                 [[("🔙 Каталог", f"cat:{arg}")]],
             )
         elif action == "admin":
-            self.admin(uid)
-            await self.tell(
-                context,
-                uid,
-                "⚙️ Студия под вашим управлением\n/adminhelp — команды и форматы.\n"
-                "Изображения можно присылать фото или файлами. Цены Stars и бонусы задаёте вы.",
-                [
-                    [("📦 Очередь заказов", "adminorders:0")],
-                    [("🗓 Слоты позиций", "adminslots:0"), ("🖼 Добавить YCH", "addych")],
-                    [("🧩 Новая загадка", "addriddle"), ("🎁 Новый товар", "additem")],
-                    [("🖼 Обложки и фото", "imagehelp"), ("📊 Статистика", "stats")],
-                    [("📣 Рассылка", "broadcast")],
-                    HOME,
-                ],
-            )
+            await self.admin_home(context, uid)
         elif action == "adminslots":
             self.admin(uid)
-            products = self.s.rows("SELECT slug,title,category FROM art_products ORDER BY category,slug")
+            products = self.s.rows(
+                "SELECT slug,title,category FROM art_products WHERE category IN ('classic','light','minecraft') AND slug NOT IN ('light_logo','light_background','mc_4d') ORDER BY category,slug"
+            )
             await self.list_page(
                 context,
                 uid,
@@ -875,6 +850,9 @@ class Bot:
             )
         elif action == "slotadmin":
             self.admin(uid)
+            product = self.s.one("SELECT title FROM art_products WHERE slug=?", (arg,))
+            if not product:
+                raise RuleError("Формат не найден.")
             slots = self.s.rows(
                 "SELECT s.*,o.id oid,o.status FROM slots s LEFT JOIN orders o ON o.slot_id=s.id "
                 "AND o.status IN ('requested','quoted','paid','working','delivered') WHERE s.slug=? ORDER BY s.id",
@@ -882,7 +860,7 @@ class Bot:
             )
             text = (
                 "Слоты позиции "
-                + arg
+                + product["title"]
                 + "\n\n"
                 + "\n".join(
                     f"#{s['id']} {s['title']}: "
@@ -917,28 +895,25 @@ class Bot:
             await self.tell(
                 context, uid, "Напишите название слота: например «Июнь · место 1» или «На этой неделе»."
             )
-        elif action in {"addriddle", "additem", "addych", "imagehelp", "stats", "broadcast"}:
+        elif action in {"addriddle", "additem", "imagehelp", "stats", "broadcast"}:
             self.admin(uid)
-            if action in {"addriddle", "additem", "addych"}:
-                await self.begin_admin_dialog(context, uid, action)
+            if action in {"addriddle", "additem"}:
+                await self.new_cube_form(context, uid, "riddles" if action == "addriddle" else "shop_items")
             elif action == "imagehelp":
-                await self.tell(
-                    context,
-                    uid,
-                    "/image main · studio · cube · classic · light · minecraft · about · riddles · shop\n"
-                    "/image product:classic_head\n/image riddle:ID\n/image item:ID\n"
-                    "После команды отправьте изображение. /portfolio classic — добавить пример работы.",
-                )
+                await self.admin_callback(context, uid, ["aui", "content"])
             elif action == "stats":
                 await self.statistics(context, uid)
+                await self.tell(context, uid, "Что дальше?", [[("← Управление", "admin")]])
             else:
                 self.s.save_dialog(uid, "broadcast", {})
                 await self.tell(
                     context,
                     uid,
-                    "Пришлите текст, фото, файл или другое сообщение для рассылки. "
-                    "Сначала появится подтверждение. /cancel — отмена.",
+                    "Пришлите текст, фото или файл для рассылки. Перед отправкой появится подтверждение.",
+                    [[("Отменить", "admin")]],
                 )
+        elif action == "addych":
+            raise RuleError("Раздел YCH убран. Используйте каталог Classic, Light или Minecraft.")
         elif action == "broadcastsend":
             self.admin(uid)
             d = self.s.dialog(uid)
@@ -951,14 +926,9 @@ class Bot:
             raise RuleError("Кнопка устарела. Отправьте /start.")
 
     async def begin_admin_dialog(self, context, uid, kind):
-        self.s.save_dialog(uid, kind, {"step": "fields"})
-        if kind == "addriddle":
-            text = "Введите через | : текст загадки | ответ | награда pts | общий лимит или -\nЗатем пришлите изображение. /cancel — отмена."
-        elif kind == "addych":
-            text = "Введите через | : название YCH | цена ₽ | число мест | описание и условия\nЗатем загрузите изображение YCH. /cancel — отмена."
-        else:
-            text = "Введите через | : название | цена pts | общий лимит или - | лимит на пользователя или - | manual или auto | описание | содержимое\nЗатем пришлите изображение. /cancel — отмена."
-        await self.tell(context, uid, text)
+        if kind == "addych":
+            raise RuleError("Раздел YCH убран.")
+        await self.new_cube_form(context, uid, "riddles" if kind == "addriddle" else "shop_items")
 
     async def on_message(self, update, context):
         uid = update.effective_user.id
@@ -967,13 +937,16 @@ class Bot:
         d = self.s.dialog(uid)
         if not d:
             await msg.reply_text(
-                "Выберите действие через /start. Сообщение Tibris можно отправить через /contact."
+                "Привет 🐾 Откройте меню, чтобы заказать арт или написать мне.",
+                reply_markup=kb([[("🏠 Открыть меню", "home"), ("💬 Написать", "contact")]]),
             )
             return
         kind, data = d
         text = (msg.text or "").strip()
         # All media and text use this single router. Broadcast always takes precedence.
-        if kind == "broadcast":
+        if kind == "adminform":
+            await self.form_value(context, uid, text, msg)
+        elif kind == "broadcast":
             self.admin(uid)
             self.s.save_dialog(uid, "broadcast_confirm", {"chat": msg.chat_id, "message": msg.message_id})
             await self.tell(
@@ -1001,11 +974,11 @@ class Bot:
             await msg.reply_text("Подтверждение передано. Tibris проверит поступление и обновит статус.")
         elif kind == "contact":
             if uid == self.cfg.admin_id:
-                raise RuleError("Для ответа клиенту используйте /reply ID текст или /send ID и файл.")
+                raise RuleError("Откройте Управление → Клиенты и нажмите «Написать».")
             await context.bot.send_message(
                 self.cfg.admin_id,
-                f"💬 Сообщение от @{update.effective_user.username or uid}\n"
-                f"ID: {uid}. Ответ: /reply {uid} текст; файл: /send {uid}.",
+                f"💬 Сообщение от @{update.effective_user.username or uid}\nID: {uid}",
+                reply_markup=kb([[("💬 Ответить", f"aui:reply:{uid}")]]),
             )
             await context.bot.copy_message(self.cfg.admin_id, msg.chat_id, msg.message_id)
             self.s.clear_dialog(uid)
@@ -1095,7 +1068,7 @@ class Bot:
                     context, uid, f"Референсов: {len(data['refs'])}/10", [[("Готово", "refs_done")]]
                 )
             else:
-                raise RuleError("Выберите купон кнопкой под заявкой.")
+                raise RuleError("Выберите вариант кнопками в последнем сообщении 🐾")
         elif kind == "promo":
             if not text:
                 raise RuleError("Промокод нужно отправить текстом.")
@@ -1114,7 +1087,9 @@ class Bot:
                 raise RuleError("Название: до 100 символов.")
             sid = self.s.add_slot(data["slug"], text)
             self.s.clear_dialog(uid)
-            await msg.reply_text(f"Слот #{sid} создан.")
+            await self.tell(
+                context, uid, f"Слот #{sid} создан.", [[("← Слоты позиции", f"slotadmin:{data['slug']}")]]
+            )
         elif kind in {"answer", "code"}:
             if not text:
                 raise RuleError("Отправьте ответ текстом.")
@@ -1131,59 +1106,6 @@ class Bot:
                     if correct
                     else f"Ответ не подошёл. Осталось попыток: {remaining}/3."
                 )
-        elif kind in {"addriddle", "additem", "addych"}:
-            self.admin(uid)
-            if data["step"] == "fields":
-                fields = [v.strip() for v in text.split("|")]
-                if kind == "addriddle":
-                    if len(fields) != 4 or not fields[0] or not fields[1]:
-                        raise RuleError("Текст | ответ | награда | лимит или -")
-                    data["fields"] = [
-                        fields[0],
-                        fields[1],
-                        positive(fields[2]),
-                        None if fields[3] == "-" else positive(fields[3]),
-                    ]
-                elif kind == "addych":
-                    if len(fields) != 4 or not fields[0] or not fields[3]:
-                        raise RuleError("Название | цена ₽ | число мест | описание")
-                    data["fields"] = [fields[0], positive(fields[1]), positive(fields[2]), fields[3]]
-                else:
-                    if len(fields) != 7 or not fields[0] or fields[4] not in {"manual", "auto"}:
-                        raise RuleError(
-                            "Название | цена | общий лимит или - | лимит пользователя или - | manual/auto | описание | содержимое"
-                        )
-                    if fields[4] == "auto" and not fields[6]:
-                        raise RuleError("Для автоматической выдачи укажите содержимое.")
-                    data["fields"] = [
-                        fields[0],
-                        positive(fields[1]),
-                        fields[5],
-                        None if fields[2] == "-" else positive(fields[2]),
-                        None if fields[3] == "-" else positive(fields[3]),
-                        fields[4] == "manual",
-                        fields[6],
-                    ]
-                data["step"] = "image"
-                self.s.save_dialog(uid, kind, data)
-                await msg.reply_text("Теперь пришлите изображение фото/файлом или напишите «нет».")
-            else:
-                media = self.media_of(msg)
-                if kind == "addych" and not media:
-                    raise RuleError("Для YCH обязательно прикрепите своё изображение.")
-                if not media and text.casefold() not in {"нет", "skip", "-"}:
-                    raise RuleError("Пришлите изображение или напишите «нет».")
-                if media and media["kind"] == "document" and not media.get("mime", "").startswith("image/"):
-                    raise RuleError("Для карточки нужен файл изображения.")
-                image, media_kind = (media["file_id"], media["kind"]) if media else ("", "photo")
-                if kind == "addriddle":
-                    oid = self.s.add_riddle(*data["fields"], image=image, kind=media_kind)
-                elif kind == "addych":
-                    oid = self.s.add_ych(*data["fields"], media)
-                else:
-                    oid = self.s.add_item(*data["fields"], image=image, kind=media_kind)
-                self.s.clear_dialog(uid)
-                await msg.reply_text(f"Создано: #{oid}.")
         else:
             raise RuleError("Используйте кнопки диалога или /cancel.")
 
@@ -1223,7 +1145,9 @@ class Bot:
         self.admin(uid)
         command = update.message.text.split()[0].split("@")[0].lstrip("/")
         args = shlex.split(update.message.text, posix=True)[1:]
-        if command in {"admin", "adminhelp"}:
+        if command == "admin":
+            await self.admin_home(context, uid)
+        elif command == "adminhelp":
             await self.tell(context, uid, ADMIN_HELP)
         elif command in {"addriddle", "additem", "addych"}:
             await self.begin_admin_dialog(context, uid, command)
@@ -1740,7 +1664,8 @@ class Bot:
             await update.effective_message.reply_text(str(e))
         except (IndexError, ValueError):
             await update.effective_message.reply_text(
-                "Проверьте формат команды и числа. /adminhelp — помощь; /cancel — отмена."
+                "Не получилось прочитать значение. Проверьте число или выберите вариант кнопкой.",
+                reply_markup=kb([[("🏠 Главная", "home")]]),
             )
         except httpx.HTTPError:
             await update.effective_message.reply_text(
@@ -1834,7 +1759,6 @@ class Bot:
             "slots",
             "openslot",
             "closeslot",
-            "addych",
             "addpromo",
             "removepromo",
             "promos",
@@ -1849,7 +1773,6 @@ class Bot:
 ADMIN_HELP = """⚙️ Tibris · команды администратора
 /start → Управление — меню и очередь
 /addriddle — загадка с фото, ответом, наградой и лимитом
-/addych — YCH с собственной картинкой и ограниченным числом мест
 /addslot SKU название · /slots [SKU]
 /openslot ID · /closeslot ID — уже принятые заказы сохраняются
 /addpromo КОД процент общий_лимит_или_- срок_в_днях_или_-
@@ -1906,8 +1829,8 @@ ADMIN_HELP = """⚙️ Tibris · команды администратора
 /cancel — отменить текущий диалог
 
 SKU Classic: classic_head classic_half classic_sticker classic_full
-SKU Light: light_icon light_chibi light_logo light_background
-SKU Minecraft: mc_skin mc_4d mc_totem mc_animal
+SKU Light: light_icon light_chibi
+SKU Minecraft: mc_skin mc_totem mc_animal
 """
 
 

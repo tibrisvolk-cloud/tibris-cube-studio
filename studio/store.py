@@ -143,6 +143,10 @@ class Store:
                     "gateway": "TEXT DEFAULT 'manual'",
                     "slot_id": "INTEGER",
                     "slot_label": "TEXT DEFAULT ''",
+                    "options": "TEXT DEFAULT '{}'",
+                    "base_rub": "INTEGER",
+                    "base_stars": "INTEGER",
+                    "preferred_method": "TEXT DEFAULT ''",
                 },
             }
             for table, columns in migrations.items():
@@ -156,6 +160,24 @@ class Store:
                     "VALUES(?,?,?,?,?,?)",
                     product,
                 )
+            # Retire formats without deleting orders, payments, uploaded media or slots.
+            c.execute(
+                "UPDATE art_products SET active=0 WHERE category='ych' OR slug IN ('light_logo','light_background','mc_4d')"
+            )
+            if not c.execute("SELECT 1 FROM settings WHERE key='simple_catalog_v3'").fetchone():
+                chibi = next(p for p in CATALOG if p[0] == "light_chibi")
+                c.execute(
+                    "UPDATE art_products SET title=?,description=? WHERE slug='light_chibi'",
+                    (chibi[2], chibi[5]),
+                )
+                # Old unfinished wizards lack the pricing snapshot used by the new builder.
+                # Accepted orders and their files are separate records and stay intact.
+                for dialog in c.execute("SELECT user_id,data FROM dialogs WHERE kind='order'").fetchall():
+                    if "product" not in json.loads(dialog["data"]):
+                        c.execute("DELETE FROM dialogs WHERE user_id=?", (dialog["user_id"],))
+                        c.execute("DELETE FROM slot_holds WHERE user_id=?", (dialog["user_id"],))
+                c.execute("DELETE FROM dialogs WHERE kind IN ('addriddle','additem','addych')")
+                c.execute("INSERT INTO settings VALUES('simple_catalog_v3','1')")
             if not c.execute("SELECT 1 FROM settings WHERE key='slots_initialized'").fetchone():
                 for product in CATALOG:
                     for number in range(1, 4):
@@ -173,7 +195,7 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS idx_task_completed ON user_subscriptions(subscription_id,completed)"
             )
             c.execute("CREATE INDEX IF NOT EXISTS idx_purchase_item ON purchases(item_id,user_id)")
-            c.execute("PRAGMA user_version=2")
+            c.execute("PRAGMA user_version=3")
 
     def rows(self, sql, args=()):
         with self.db() as c:
@@ -470,7 +492,9 @@ class Store:
                 "INSERT INTO coupons(user_id,reward_id,percent) VALUES(?,?,?)", (uid, rid, r["percent"])
             ).lastrowid
 
-    def create_order(self, uid, slug, brief, refs, coupon=None, slot=None):
+    def create_order(
+        self, uid, slug, brief, refs, coupon=None, slot=None, options=None, amounts=None, method=""
+    ):
         if not brief.strip() or len(brief) > 3500 or len(refs) > 10:
             raise RuleError("ТЗ: до 3500 символов; референсы: до 10 файлов.")
         with self.db(True) as c:
@@ -511,8 +535,21 @@ class Store:
                 discount = r["percent"]
                 c.execute("UPDATE coupons SET state='reserved' WHERE id=?", (coupon,))
             oid = c.execute(
-                "INSERT INTO orders(user_id,slug,brief,refs,coupon_id,discount,slot_id,slot_label) VALUES(?,?,?,?,?,?,?,?)",
-                (uid, slug, brief, json.dumps(refs), coupon, discount, selected["id"], selected["title"]),
+                "INSERT INTO orders(user_id,slug,brief,refs,coupon_id,discount,slot_id,slot_label,options,base_rub,base_stars,preferred_method) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    uid,
+                    slug,
+                    brief,
+                    json.dumps(refs),
+                    coupon,
+                    discount,
+                    selected["id"],
+                    selected["title"],
+                    json.dumps(options or {}),
+                    (amounts or {}).get("rub"),
+                    (amounts or {}).get("stars"),
+                    method,
+                ),
             ).lastrowid
             c.execute("DELETE FROM slot_holds WHERE user_id=?", (uid,))
             self._sync_ych(c, slug)
@@ -561,6 +598,49 @@ class Store:
             c.execute(
                 "UPDATE orders SET payment_method='',external_currency='',external_amount='',external_instructions='',proof='',gateway='manual' WHERE id=?",
                 (oid,),
+            )
+        return self.order(oid)
+
+    def choose_payment(self, uid, oid, method, config=None):
+        """Switch a quoted order before any invoice/receipt is pending, with atomic guards."""
+        from .ordering import method_amount
+
+        with self.db(True) as c:
+            self._invoice_guard(c, oid)
+            o = c.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (oid, uid)).fetchone()
+            if (
+                not o
+                or o["status"] != "quoted"
+                or o["checkout_until"] > time.time()
+                or o["proof"]
+                or o["points"]
+                or o["discount"] == 100
+            ):
+                raise RuleError("Способ оплаты сейчас нельзя изменить. Откройте актуальный заказ.")
+            if method == "stars":
+                if not o["stars"]:
+                    raise RuleError("Цена в Stars ещё не установлена.")
+                c.execute(
+                    "UPDATE orders SET payment_method='',external_currency='',external_amount='',external_instructions='',gateway='manual',invoice=? WHERE id=?",
+                    (secrets.token_urlsafe(24), oid),
+                )
+            else:
+                if not config or not config.get("instructions"):
+                    raise RuleError("Способ оплаты ещё не настроен.")
+                amount = method_amount(o["rub"], config)
+                c.execute(
+                    "UPDATE orders SET payment_method=?,external_currency=?,external_amount=?,external_instructions=?,gateway=?,invoice=NULL WHERE id=?",
+                    (
+                        method,
+                        config["currency"],
+                        amount,
+                        config["instructions"],
+                        config.get("provider", "manual"),
+                        oid,
+                    ),
+                )
+            c.execute(
+                "UPDATE orders SET preferred_method=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (method, oid)
             )
         return self.order(oid)
 

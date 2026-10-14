@@ -266,7 +266,8 @@ def test_dialog_persistence_and_expiry(store):
 
 def test_actual_rub_prices_without_example_star_prices(store):
     rows = store.rows("SELECT * FROM art_products")
-    assert len(rows) == 12
+    assert len(rows) == 9
     assert all(p["stars"] is None and p["points"] is None for p in rows)
     assert store.one("SELECT rub FROM art_products WHERE slug='classic_head'")["rub"] == 180
-    assert store.one("SELECT rub FROM art_products WHERE slug='mc_4d'")["rub"] == 400
+    assert store.one("SELECT rub FROM art_products WHERE slug='mc_skin'")["rub"] == 300
+    assert store.one("SELECT slug FROM art_products WHERE slug='mc_4d'") is None
